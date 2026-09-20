@@ -95,3 +95,50 @@ export interface ReproResult {
   totalConflicts: number;
   paths: ReproPath[];
 }
+
+// ---------- 优先级修复 ----------
+export interface RepairConstraint {
+  a: string;
+  b: string;
+  diff: 0 | 1;
+  line: number;
+}
+
+export interface RepairExpectation {
+  line: number;
+  path: string;
+  expected: string;
+  matched: string[];
+  winnerBefore: string | null;
+  satisfiedBefore: boolean;
+  winnerAfter: string | null;
+  satisfiedAfter: boolean | null;
+}
+
+export interface RepairInvalidLine {
+  line: number;
+  raw: string;
+  error: string;
+}
+
+export interface RepairAdjustment {
+  id: string;
+  pattern: string;
+  before: number;
+  after: number;
+}
+
+export interface RepairConflict {
+  lines: number[];
+  chain: RepairConstraint[];
+}
+
+export interface PriorityRepairResult {
+  rules: AnalyzedRule[];
+  expectations: RepairExpectation[];
+  invalidLines: RepairInvalidLine[];
+  feasible: boolean;
+  conflict: RepairConflict | null;
+  adjustments: RepairAdjustment[];
+  totalIncrease: number;
+}

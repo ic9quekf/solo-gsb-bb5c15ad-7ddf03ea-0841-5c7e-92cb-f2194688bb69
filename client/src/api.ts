@@ -1,4 +1,11 @@
-import type { AnalysisResult, ImpactResult, MatchResult, ReproResult, RuleInput } from './types';
+import type {
+  AnalysisResult,
+  ImpactResult,
+  MatchResult,
+  PriorityRepairResult,
+  ReproResult,
+  RuleInput,
+} from './types';
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -31,4 +38,11 @@ export function computeImpact(
 
 export function computeRepro(rules: RuleInput[], ruleIds: string[]): Promise<ReproResult> {
   return post<ReproResult>('/api/repro', { rules, ruleIds });
+}
+
+export function repairPriority(
+  rules: RuleInput[],
+  expectations: string[],
+): Promise<PriorityRepairResult> {
+  return post<PriorityRepairResult>('/api/priority-repair', { rules, expectations });
 }

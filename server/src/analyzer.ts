@@ -668,3 +668,339 @@ export function buildRepro(inputs: RuleInput[], selectedIds: string[]): ReproRes
     paths,
   };
 }
+
+// ---------- 优先级修复 ----------
+
+/** 0/1 差值约束：x[a] - x[b] >= diff（diff 为 0 表示持平即可凭输入顺序胜出）。 */
+export interface RepairConstraint {
+  a: string; // 需要不低于对方的规则 id
+  b: string; // 被压制的规则 id
+  diff: 0 | 1;
+  line: number; // 来源期望行号（1 起）
+}
+
+/** 一条合法期望的验证结果。 */
+export interface RepairExpectation {
+  line: number; // 期望在输入中的行号（1 起）
+  path: string; // 规范化后的请求路径
+  expected: string; // 期望胜出的规则 id
+  matched: string[]; // 命中该路径的启用规则 id（按调整前胜出顺序）
+  winnerBefore: string | null; // 调整前实际胜出的规则 id
+  satisfiedBefore: boolean;
+  winnerAfter: string | null; // 调整后实际胜出的规则 id（无可行方案时为 null）
+  satisfiedAfter: boolean | null; // 无可行方案时为 null
+}
+
+export interface RepairInvalidLine {
+  line: number;
+  raw: string;
+  error: string;
+}
+
+export interface RepairAdjustment {
+  id: string;
+  pattern: string;
+  before: number;
+  after: number;
+}
+
+/** 正权环：一组相互矛盾、无法同时满足的闭环期望。 */
+export interface RepairConflict {
+  lines: number[]; // 参与闭环的期望行号（升序去重）
+  chain: RepairConstraint[]; // 闭环上的约束链（沿环序）
+}
+
+export interface PriorityRepairResult {
+  rules: AnalyzedRule[];
+  expectations: RepairExpectation[];
+  invalidLines: RepairInvalidLine[];
+  feasible: boolean;
+  conflict: RepairConflict | null; // 仅不可行时非空
+  adjustments: RepairAdjustment[]; // 仅可行时给出（可能为空数组 = 无需调整）
+  totalIncrease: number; // 全部规则增幅之和
+}
+
+/**
+ * 解析一行期望：格式为 “请求路径 => 期望胜出规则ID”。
+ * 空行与 # 注释返回 null（跳过）；非法行返回 { error }。
+ */
+export function parseExpectationLine(
+  line: string,
+): { path: string; expected: string } | { error: string } | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const parts = trimmed.split('=>');
+  if (parts.length === 1) {
+    return { error: '缺少分隔符 "=>"（格式：请求路径 => 期望胜出规则ID）' };
+  }
+  if (parts.length > 2) return { error: '一行只能包含一个 "=>"' };
+  const path = parts[0].trim();
+  const expected = parts[1].trim();
+  if (!path) return { error: '请求路径为空' };
+  if (/\s/.test(path)) return { error: `路径 "${path}" 中不能包含空白字符` };
+  if (!path.startsWith('/')) return { error: `路径 "${path}" 必须以 / 开头` };
+  if (!expected) return { error: '期望胜出规则 ID 为空' };
+  if (/\s/.test(expected)) return { error: `规则 ID "${expected}" 中不能包含空白字符` };
+  if (!/^R\d+$/.test(expected)) {
+    return { error: `规则 ID "${expected}" 非法（应为 R1、R2……）` };
+  }
+  return { path, expected };
+}
+
+/** Tarjan 强连通分量（确定性：节点与邻边均按插入顺序访问）。返回每个节点的分量编号。 */
+function tarjanScc(n: number, adj: number[][]): number[] {
+  const index = new Array<number>(n).fill(-1);
+  const low = new Array<number>(n).fill(0);
+  const onStack = new Array<boolean>(n).fill(false);
+  const comp = new Array<number>(n).fill(-1);
+  const stack: number[] = [];
+  let counter = 0;
+  let compCount = 0;
+  const visit = (v: number): void => {
+    index[v] = low[v] = counter++;
+    stack.push(v);
+    onStack[v] = true;
+    for (const w of adj[v]) {
+      if (index[w] === -1) {
+        visit(w);
+        low[v] = Math.min(low[v], low[w]);
+      } else if (onStack[w]) {
+        low[v] = Math.min(low[v], index[w]);
+      }
+    }
+    if (low[v] === index[v]) {
+      for (;;) {
+        const w = stack.pop()!;
+        onStack[w] = false;
+        comp[w] = compCount;
+        if (w === v) break;
+      }
+      compCount++;
+    }
+  };
+  for (let v = 0; v < n; v++) if (index[v] === -1) visit(v);
+  return comp;
+}
+
+interface DiffEdge {
+  from: number; // 规则下标 b
+  to: number; // 规则下标 a：x[a] >= x[b] + w
+  w: 0 | 1;
+  c: RepairConstraint;
+}
+
+/**
+ * 求解 0/1 差值约束系统：在只允许提高整数优先级（x[i] >= 原优先级）的前提下，
+ * 返回逐项增幅最小的确定性方案（此类下界约束系统的分量最小解唯一，等于
+ * 缩点 DAG 上的最长路解）。含正权环时不可行，返回构成闭环的冲突期望。
+ */
+function solveDiffConstraints(
+  rules: AnalyzedRule[],
+  constraints: RepairConstraint[],
+): { values: number[] } | { conflict: RepairConflict } {
+  const n = rules.length;
+  const indexOf = new Map(rules.map((r, i) => [r.id, i] as [string, number]));
+
+  // 同一有序对 (a, b) 只保留最强约束（diff 大者）；并列时保留行号最小者，保证确定性
+  const dedup = new Map<string, RepairConstraint>();
+  for (const c of constraints) {
+    const key = `${c.a}|${c.b}`;
+    const prev = dedup.get(key);
+    if (!prev || c.diff > prev.diff || (c.diff === prev.diff && c.line < prev.line)) {
+      dedup.set(key, c);
+    }
+  }
+  const edges: DiffEdge[] = [...dedup.values()].map((c) => ({
+    from: indexOf.get(c.b)!,
+    to: indexOf.get(c.a)!,
+    w: c.diff,
+    c,
+  }));
+  const adjEdges: number[][] = Array.from({ length: n }, () => []);
+  const adjAll: number[][] = Array.from({ length: n }, () => []);
+  edges.forEach((e, i) => {
+    adjEdges[e.from].push(i);
+    adjAll[e.from].push(e.to);
+  });
+
+  // 正权环检测：权重非负，任何含权 1 边的有向环即不可行
+  const compAll = tarjanScc(n, adjAll);
+  const trigger = edges.find((e) => e.w === 1 && compAll[e.from] === compAll[e.to]);
+  if (trigger) {
+    // 提取一个确定的正权环：trigger 边 + 从 trigger.to 回到 trigger.from 的 BFS 最短路径
+    const prevEdge = new Array<number>(n).fill(-1);
+    const seen = new Array<boolean>(n).fill(false);
+    seen[trigger.to] = true;
+    const queue: number[] = [trigger.to];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      if (cur === trigger.from) break;
+      for (const ei of adjEdges[cur]) {
+        const ne = edges[ei];
+        if (!seen[ne.to]) {
+          seen[ne.to] = true;
+          prevEdge[ne.to] = ei;
+          queue.push(ne.to);
+        }
+      }
+    }
+    const pathEdges: DiffEdge[] = [];
+    let cur = trigger.from;
+    while (cur !== trigger.to) {
+      const e = edges[prevEdge[cur]];
+      pathEdges.unshift(e);
+      cur = e.from;
+    }
+    const chain = [trigger.c, ...pathEdges.map((e) => e.c)];
+    const lines = [...new Set(chain.map((c) => c.line))].sort((x, y) => x - y);
+    return { conflict: { lines, chain } };
+  }
+
+  // 零差约束合并：0 权边强连通分量内的规则优先级必须相等，缩点后为 DAG
+  const adjZero: number[][] = Array.from({ length: n }, () => []);
+  for (const e of edges) if (e.w === 0) adjZero[e.from].push(e.to);
+  const comp0 = tarjanScc(n, adjZero);
+  const compCount = n === 0 ? 0 : Math.max(...comp0) + 1;
+
+  // 每个分量的下界 = 成员原优先级的最大值
+  const val = new Array<number>(compCount).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (rules[i].priority > val[comp0[i]]) val[comp0[i]] = rules[i].priority;
+  }
+
+  // 缩点后的 DAG 边（同一对分量间权取最大）
+  const dagAdj: number[][] = Array.from({ length: compCount }, () => []);
+  const dagW = new Map<string, number>();
+  const indeg = new Array<number>(compCount).fill(0);
+  for (const e of edges) {
+    const c1 = comp0[e.from];
+    const c2 = comp0[e.to];
+    if (c1 === c2) continue; // 0 权边已合并；1 权边同分量即正权环（上面已拦截）
+    const key = `${c1}|${c2}`;
+    const prev = dagW.get(key);
+    if (prev === undefined) {
+      dagAdj[c1].push(c2);
+      indeg[c2]++;
+      dagW.set(key, e.w);
+    } else if (e.w > prev) {
+      dagW.set(key, e.w);
+    }
+  }
+
+  // Kahn 拓扑序（每次取编号最小的分量，保证确定性）上求最长路
+  const indegWork = [...indeg];
+  const ready: number[] = [];
+  for (let c = 0; c < compCount; c++) if (indegWork[c] === 0) ready.push(c);
+  while (ready.length > 0) {
+    let pick = 0;
+    for (let i = 1; i < ready.length; i++) if (ready[i] < ready[pick]) pick = i;
+    const c = ready.splice(pick, 1)[0];
+    for (const d of dagAdj[c]) {
+      const w = dagW.get(`${c}|${d}`)!;
+      if (val[c] + w > val[d]) val[d] = val[c] + w;
+      if (--indegWork[d] === 0) ready.push(d);
+    }
+  }
+
+  return { values: rules.map((_, i) => val[comp0[i]]) };
+}
+
+/**
+ * 优先级修复：逐行解析 “请求路径 => 期望胜出规则ID”，按当前匹配与
+ * “优先级高者先、平手按输入顺序”推导规则间的 0/1 差值约束（目标规则相对
+ * 每个其他命中者：目标输入顺序靠前则 x[目标] >= x[对方]，靠后则
+ * x[目标] >= x[对方] + 1），零差约束合并求解；在只允许提高整数优先级的
+ * 前提下给出逐项增幅最小的确定性方案。约束系统含正权环时不可行，返回一组
+ * 闭环冲突期望。非法路径、未命中或目标规则不匹配的行逐条记录错误，不参与求解。
+ */
+export function repairPriorities(inputs: RuleInput[], lines: string[]): PriorityRepairResult {
+  const { rules } = analyze(inputs);
+  const byId = new Map(rules.map((r) => [r.id, r]));
+  const expectations: RepairExpectation[] = [];
+  const invalidLines: RepairInvalidLine[] = [];
+  const constraints: RepairConstraint[] = [];
+
+  lines.forEach((line, i) => {
+    const lineNo = i + 1;
+    const parsed = parseExpectationLine(line);
+    if (parsed === null) return; // 空行或注释
+    const fail = (error: string): void => {
+      invalidLines.push({ line: lineNo, raw: line.trim(), error });
+    };
+    if ('error' in parsed) return fail(parsed.error);
+    const target = byId.get(parsed.expected);
+    if (!target) return fail(`规则 ${parsed.expected} 不存在`);
+    if (!target.enabled) return fail(`规则 ${target.id} 已禁用，无法胜出`);
+    if (target.error) return fail(`规则 ${target.id} 非法：${target.error}`);
+    const pathSegs = splitPath(parsed.path);
+    const matched = rules
+      .filter((r) => r.enabled && !r.error && matchSegments(r.segments, pathSegs))
+      .sort((x, y) => y.priority - x.priority || x.index - y.index);
+    if (matched.length === 0) return fail('没有启用规则命中该路径（未命中）');
+    if (!matched.some((r) => r.id === target.id)) {
+      return fail(`目标规则 ${target.id} 不匹配该路径`);
+    }
+    expectations.push({
+      line: lineNo,
+      path: '/' + pathSegs.join('/'),
+      expected: target.id,
+      matched: matched.map((r) => r.id),
+      winnerBefore: matched[0].id,
+      satisfiedBefore: matched[0].id === target.id,
+      winnerAfter: null,
+      satisfiedAfter: null,
+    });
+    // 目标必须击败所有其他命中者；已满足的期望同样生成保护性约束，
+    // 防止其他期望抬高相关规则后反过来打破本行期望（零差约束需合并求解）
+    for (const other of matched) {
+      if (other.id === target.id) continue;
+      constraints.push({
+        a: target.id,
+        b: other.id,
+        diff: other.index < target.index ? 1 : 0,
+        line: lineNo,
+      });
+    }
+  });
+
+  const solved = solveDiffConstraints(rules, constraints);
+  if ('conflict' in solved) {
+    return {
+      rules,
+      expectations,
+      invalidLines,
+      feasible: false,
+      conflict: solved.conflict,
+      adjustments: [],
+      totalIncrease: 0,
+    };
+  }
+
+  // 用建议优先级逐条重新模拟，验证每条期望
+  const adjusted = rules.map((r, i) => ({ ...r, priority: solved.values[i] }));
+  for (const exp of expectations) {
+    const winner = findWinner(adjusted, splitPath(exp.path));
+    exp.winnerAfter = winner ? winner.id : null;
+    exp.satisfiedAfter = exp.winnerAfter === exp.expected;
+  }
+
+  const adjustments: RepairAdjustment[] = [];
+  let totalIncrease = 0;
+  rules.forEach((r, i) => {
+    const after = solved.values[i];
+    if (after > r.priority) {
+      adjustments.push({ id: r.id, pattern: r.pattern, before: r.priority, after });
+      totalIncrease += after - r.priority;
+    }
+  });
+
+  return {
+    rules,
+    expectations,
+    invalidLines,
+    feasible: true,
+    conflict: null,
+    adjustments,
+    totalIncrease,
+  };
+}

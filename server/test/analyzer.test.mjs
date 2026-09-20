@@ -11,6 +11,8 @@ import {
   impact,
   buildRepro,
   selectMinCover,
+  parseExpectationLine,
+  repairPriorities,
 } from '../dist/analyzer.js';
 
 const P = (s) => parsePattern(s);
@@ -379,5 +381,168 @@ assert.deepEqual(
 );
 // 空全集 → 空解
 assert.deepEqual(selectMinCover([], [], [], 0), []);
+
+// ---------- 优先级修复：期望行解析 ----------
+assert.deepEqual(parseExpectationLine('/a => R1'), { path: '/a', expected: 'R1' });
+assert.deepEqual(parseExpectationLine('  /a/b  =>  R12  '), { path: '/a/b', expected: 'R12' });
+assert.equal(parseExpectationLine(''), null); // 空行跳过
+assert.equal(parseExpectationLine('   '), null);
+assert.equal(parseExpectationLine('# 注释'), null); // 注释跳过
+assert.ok('error' in parseExpectationLine('/a')); // 缺少 =>
+assert.ok('error' in parseExpectationLine('/a => R1 => R2')); // 多个 =>
+assert.ok('error' in parseExpectationLine('=> R1')); // 路径为空
+assert.ok('error' in parseExpectationLine('/a =>')); // ID 为空
+assert.ok('error' in parseExpectationLine('a => R1')); // 路径必须以 / 开头
+assert.ok('error' in parseExpectationLine('/a b => R1')); // 路径含空白
+assert.ok('error' in parseExpectationLine('/a => R')); // ID 非法
+assert.ok('error' in parseExpectationLine('/a => r1'));
+
+// ---------- 优先级修复：基本求解（只提高、逐项最小、确定性） ----------
+const fixRules = [
+  { pattern: '/api/users/:id', priority: 100, enabled: true }, // R1
+  { pattern: '/api/users/new', priority: 10, enabled: true }, // R2
+  { pattern: '/api/users/new', priority: 90, enabled: true }, // R3
+  { pattern: '/api/*', priority: 1, enabled: true }, // R4
+  { pattern: '/health', priority: 0, enabled: true }, // R5
+];
+const fix1 = repairPriorities(fixRules, [
+  '# 注释与空行跳过',
+  '',
+  '/api/users/new => R2', // R2 需压过 R1(100)、R3(90)、R4(1)
+  '/health => R5', // 原本即满足
+]);
+assert.equal(fix1.feasible, true);
+assert.equal(fix1.conflict, null);
+// R2 对 R1（顺序靠前）需 +1 → 101；对 R3（顺序靠后）持平即可 → 90；取最大 101
+assert.deepEqual(fix1.adjustments, [
+  { id: 'R2', pattern: '/api/users/new', before: 10, after: 101 },
+]);
+assert.equal(fix1.totalIncrease, 91);
+const fix1Exp1 = fix1.expectations.find((e) => e.line === 3);
+assert.equal(fix1Exp1.path, '/api/users/new');
+assert.equal(fix1Exp1.winnerBefore, 'R1');
+assert.equal(fix1Exp1.satisfiedBefore, false);
+assert.equal(fix1Exp1.winnerAfter, 'R2');
+assert.equal(fix1Exp1.satisfiedAfter, true);
+assert.deepEqual(fix1Exp1.matched, ['R1', 'R3', 'R2', 'R4']); // 调整前胜出顺序
+const fix1Exp2 = fix1.expectations.find((e) => e.line === 4);
+assert.equal(fix1Exp2.satisfiedBefore, true);
+assert.equal(fix1Exp2.satisfiedAfter, true);
+assert.equal(fix1.invalidLines.length, 0);
+// 确定性：相同输入重复计算结果完全一致
+assert.deepEqual(repairPriorities(fixRules, ['# c', '', '/api/users/new => R2', '/health => R5']), fix1);
+
+// 平手按输入顺序：顺序靠前者只需 >=（0 差约束），靠后者必须 +1（1 差约束）
+const tieRules = [
+  { pattern: '/a/:x', priority: 5, enabled: true }, // R1
+  { pattern: '/a/:y', priority: 5, enabled: true }, // R2
+];
+const tieFront = repairPriorities(tieRules, ['/a/b => R1']);
+assert.equal(tieFront.adjustments.length, 0); // 已满足且受零差约束保护，无需调整
+assert.equal(tieFront.expectations[0].satisfiedAfter, true);
+const tieBack = repairPriorities(tieRules, ['/a/b => R2']);
+assert.deepEqual(tieBack.adjustments, [
+  { id: 'R2', pattern: '/a/:y', before: 5, after: 6 },
+]);
+
+// 零差约束合并求解：链式传播把整条链拉到同一高度
+const chainRules = [
+  { pattern: '/a/*', priority: 1, enabled: true }, // R1
+  { pattern: '/z', priority: 0, enabled: true }, // R2
+  { pattern: '/*/x', priority: 3, enabled: true }, // R3
+  { pattern: '/y', priority: 0, enabled: true }, // R4
+  { pattern: '/b/x', priority: 5, enabled: true }, // R5
+];
+const chain = repairPriorities(chainRules, ['/a/x => R1', '/b/x => R3']);
+assert.equal(chain.feasible, true);
+// x[R1] >= x[R3]（0 差）、x[R3] >= x[R5]（0 差）→ 三者合并求解后同为 5
+assert.deepEqual(chain.adjustments, [
+  { id: 'R1', pattern: '/a/*', before: 1, after: 5 },
+  { id: 'R3', pattern: '/*/x', before: 3, after: 5 },
+]);
+assert.equal(chain.totalIncrease, 6);
+assert.ok(chain.expectations.every((e) => e.satisfiedAfter === true));
+
+// 已满足的期望也受保护：其他期望抬高相关规则时，已满足的目标被一并抬高
+const protect = repairPriorities(
+  [
+    { pattern: '/a', priority: 10, enabled: true }, // R1
+    { pattern: '/*', priority: 5, enabled: true }, // R2
+    { pattern: '/c', priority: 100, enabled: true }, // R3
+  ],
+  ['/a => R1', '/c => R2'],
+);
+assert.equal(protect.feasible, true);
+// R2 被抬到 100 后，若不与 R1 合并求解，/a 的期望会被打破；保护性零差约束把 R1 一并抬到 100
+assert.deepEqual(protect.adjustments, [
+  { id: 'R1', pattern: '/a', before: 10, after: 100 },
+  { id: 'R2', pattern: '/*', before: 5, after: 100 },
+]);
+assert.ok(protect.expectations.every((e) => e.satisfiedAfter === true));
+
+// ---------- 优先级修复：正权环 → 闭环冲突期望 ----------
+// 同一路径期望两个不同胜者：x[R2] >= x[R1]+1 与 x[R1] >= x[R2] 构成正权环
+const loop2 = repairPriorities(tieRules, ['/a/b => R2', '/a/b => R1']);
+assert.equal(loop2.feasible, false);
+assert.deepEqual(loop2.conflict.lines, [1, 2]);
+assert.equal(loop2.conflict.chain.length, 2);
+assert.equal(loop2.adjustments.length, 0);
+assert.equal(loop2.totalIncrease, 0);
+assert.equal(loop2.expectations.length, 2);
+assert.ok(loop2.expectations.every((e) => e.satisfiedAfter === null && e.winnerAfter === null));
+
+// 三条期望构成的闭环：只报告环上的期望（第 2、3 行），环外期望不株连
+const loop3 = repairPriorities(chainRules, ['/a/x => R1', '/b/x => R3', '/b/x => R5']);
+assert.equal(loop3.feasible, false);
+assert.deepEqual(loop3.conflict.lines, [2, 3]);
+// 确定性：相同输入的冲突报告完全一致
+assert.deepEqual(repairPriorities(chainRules, ['/a/x => R1', '/b/x => R3', '/b/x => R5']), loop3);
+
+// ---------- 优先级修复：逐行错误提示 ----------
+const errs = repairPriorities(fixRules, [
+  'not-a-path => R1', // 路径必须以 / 开头
+  '/nope/here => R1', // 未命中
+  '/api/users/new => R9', // 规则不存在
+  '/health => R1', // 目标规则不匹配该路径
+  '/api/users/new => R2', // 合法
+]);
+assert.equal(errs.expectations.length, 1);
+assert.deepEqual(
+  errs.invalidLines.map((v) => v.line),
+  [1, 2, 3, 4],
+); // 逐行提示，行号从 1 起
+assert.match(errs.invalidLines[0].error, /以 \/ 开头/);
+assert.match(errs.invalidLines[1].error, /未命中/);
+assert.match(errs.invalidLines[2].error, /不存在/);
+assert.match(errs.invalidLines[3].error, /不匹配/);
+// 非法行不参与求解：合法行照常得到方案
+assert.equal(errs.feasible, true);
+assert.deepEqual(errs.adjustments, [
+  { id: 'R2', pattern: '/api/users/new', before: 10, after: 101 },
+]);
+
+// 禁用与非法规则不能作为期望目标
+const disTarget = repairPriorities(
+  [
+    { pattern: '/a', priority: 1, enabled: false }, // R1 已禁用
+    { pattern: '/a', priority: 1, enabled: true }, // R2
+  ],
+  ['/a => R1'],
+);
+assert.match(disTarget.invalidLines[0].error, /禁用/);
+const badTarget = repairPriorities(
+  [
+    { pattern: '/a/b*c', priority: 1, enabled: true }, // R1 非法
+    { pattern: '/a', priority: 1, enabled: true }, // R2
+  ],
+  ['/a => R1'],
+);
+assert.match(badTarget.invalidLines[0].error, /非法/);
+
+// 空期望列表 → 可行且无需调整
+const empty = repairPriorities(fixRules, []);
+assert.equal(empty.feasible, true);
+assert.equal(empty.adjustments.length, 0);
+assert.equal(empty.expectations.length, 0);
 
 console.log('✔ analyzer 全部测试通过');

@@ -5,6 +5,7 @@ import {
   simulate,
   impact,
   buildRepro,
+  repairPriorities,
   MIN_REPRO_RULES,
   MAX_REPRO_RULES,
   RuleInput,
@@ -18,6 +19,8 @@ const MAX_PATTERN_LEN = 500;
 const MAX_SAMPLE_LINES = 5000;
 const MAX_SAMPLE_LINE_LEN = 500;
 const MAX_RULE_ID_LEN = 20;
+const MAX_EXPECTATION_LINES = 1000;
+const MAX_EXPECTATION_LINE_LEN = 500;
 
 /** 清洗客户端提交的单条规则，返回安全的 RuleInput。 */
 function sanitizeRule(raw: unknown): RuleInput | null {
@@ -112,6 +115,29 @@ app.post('/api/repro', (req: Request, res: Response) => {
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+app.post('/api/priority-repair', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown> | null;
+  if (body === null || typeof body !== 'object') {
+    res.status(400).json({ error: '请求非法：需要 JSON 对象' });
+    return;
+  }
+  const rules = sanitizeRuleList(body.rules);
+  const expectationsRaw = body.expectations;
+  if (
+    !rules ||
+    !Array.isArray(expectationsRaw) ||
+    expectationsRaw.length > MAX_EXPECTATION_LINES ||
+    !expectationsRaw.every((s) => typeof s === 'string')
+  ) {
+    res.status(400).json({
+      error: `请求非法：需要 rules 数组（至多 ${MAX_RULES} 条）和 expectations 字符串数组（至多 ${MAX_EXPECTATION_LINES} 行）`,
+    });
+    return;
+  }
+  const lines = (expectationsRaw as string[]).map((s) => s.slice(0, MAX_EXPECTATION_LINE_LEN));
+  res.json(repairPriorities(rules, lines));
 });
 
 app.get('/api/health', (_req: Request, res: Response) => {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { analyzeRules, matchPath, computeRepro } from './api';
 import type { AnalysisResult, MatchResult, ReproResult, RuleInput } from './types';
 import ImpactView from './ImpactView';
+import RepairView from './RepairView';
 
 const MAX_REPRO_RULES = 20; // 与后端一致：复现包最多选择的规则数
 
@@ -28,6 +29,12 @@ const SAMPLES_EXAMPLE = `# 每行一条：[次数] 路径，次数省略时为 1
 2 /health
 7 /internal/ops
 /api/other
+`;
+
+const EXPECTATIONS_EXAMPLE = `# 每行一条：请求路径 => 期望胜出规则ID
+# 仅允许提高整数优先级；相互矛盾的期望会报闭环冲突
+/api/users/new => R2
+/health => R5
 `;
 
 /** 解析一行输入为 { priority, pattern }；空行与 # 注释返回 null。 */
@@ -57,10 +64,11 @@ function toRuleInputs(text: string, disabled?: Set<number>): RuleInput[] {
 }
 
 export default function App() {
-  const [mode, setMode] = useState<'analyze' | 'impact'>('analyze');
+  const [mode, setMode] = useState<'analyze' | 'impact' | 'repair'>('analyze');
   const [text, setText] = useState(EXAMPLE);
   const [candidateText, setCandidateText] = useState(CANDIDATE_EXAMPLE);
   const [samplesText, setSamplesText] = useState(SAMPLES_EXAMPLE);
+  const [expectationsText, setExpectationsText] = useState(EXPECTATIONS_EXAMPLE);
   const [disabled, setDisabled] = useState<Set<number>>(new Set());
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
@@ -265,6 +273,12 @@ export default function App() {
           >
             变更影响
           </button>
+          <button
+            className={mode === 'repair' ? 'tab tab-active' : 'tab'}
+            onClick={() => setMode('repair')}
+          >
+            优先级修复
+          </button>
         </div>
       </header>
 
@@ -278,6 +292,14 @@ export default function App() {
           onSamplesTextChange={setSamplesText}
           baselineInputs={ruleInputs}
           candidateInputs={candidateInputs}
+        />
+      ) : mode === 'repair' ? (
+        <RepairView
+          rulesText={text}
+          onRulesTextChange={setText}
+          expectationsText={expectationsText}
+          onExpectationsTextChange={setExpectationsText}
+          ruleInputs={ruleInputs}
         />
       ) : (
       <main className="layout">

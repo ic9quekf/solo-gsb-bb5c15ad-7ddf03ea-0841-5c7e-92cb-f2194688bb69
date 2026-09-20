@@ -346,3 +346,14 @@ code {
   background: rgba(79, 140, 255, 0.14);
   color: #9db9ff;
 }
+
+/* ---------- 优先级修复 ---------- */
+.delta-up {
+  color: var(--winner);
+  font-weight: 600;
+}
+
+.conflict-card-error {
+  border-color: rgba(239, 68, 68, 0.5);
+  margin-bottom: 12px;
+}
