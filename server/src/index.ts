@@ -5,8 +5,11 @@ import {
   simulate,
   impact,
   buildRepro,
+  repairPriorities,
   MIN_REPRO_RULES,
   MAX_REPRO_RULES,
+  MAX_REPAIR_LINES,
+  MAX_REPAIR_LINE_LEN,
   RuleInput,
 } from './analyzer';
 
@@ -112,6 +115,24 @@ app.post('/api/repro', (req: Request, res: Response) => {
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+app.post('/api/repair', (req: Request, res: Response) => {
+  const rules = sanitizeRules(req.body);
+  const expectationsRaw = (req.body as Record<string, unknown> | null)?.expectations;
+  if (
+    !rules ||
+    !Array.isArray(expectationsRaw) ||
+    expectationsRaw.length > MAX_REPAIR_LINES ||
+    !expectationsRaw.every((s) => typeof s === 'string')
+  ) {
+    res.status(400).json({
+      error: `请求非法：需要 rules 数组和 expectations 字符串数组（至多 ${MAX_REPAIR_LINES} 行）`,
+    });
+    return;
+  }
+  const lines = (expectationsRaw as string[]).map((s) => s.slice(0, MAX_REPAIR_LINE_LEN));
+  res.json(repairPriorities(rules, lines));
 });
 
 app.get('/api/health', (_req: Request, res: Response) => {

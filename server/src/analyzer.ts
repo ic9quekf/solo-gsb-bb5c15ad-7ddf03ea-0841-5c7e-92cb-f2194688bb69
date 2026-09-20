@@ -112,6 +112,61 @@ export interface ReproResult {
   paths: ReproPath[]; // 入选的最少路径集合（按路径字典序）
 }
 
+// ---------- 优先级修复 ----------
+
+/** 一条期望推导出的规则间差值约束（边：from 的新优先级 + weight ≤ to 的新优先级）。 */
+export interface RepairConstraint {
+  fromId: string;
+  toId: string;
+  weight: 0 | 1; // 0：保持不低于即可；1：必须严格超过
+}
+
+/** 一条合法的修复期望及其验证结果。 */
+export interface RepairExpectation {
+  line: number; // 在输入中的行号（1 起）
+  raw: string;
+  path: string; // 规范化后的请求路径
+  targetId: string; // 期望胜出规则 id
+  matches: string[]; // 该路径命中的启用规则 id（按调整前胜出顺序）
+  currentWinnerId: string | null; // 调整前胜出规则
+  afterWinnerId: string | null; // 调整后胜出规则（不可行时为 null）
+  verified: boolean; // 调整后实际胜出者是否等于期望
+  constraints: RepairConstraint[]; // 该期望推导出的差值约束（按对手规则输入顺序）
+}
+
+/** 逐行解析失败的期望（非法路径、未命中、目标规则不匹配等）。 */
+export interface RepairInvalidLine {
+  line: number;
+  raw: string;
+  error: string;
+}
+
+/** 单条规则调整前后的优先级。 */
+export interface RepairRuleChange {
+  id: string;
+  index: number;
+  pattern: string;
+  before: number;
+  after: number;
+  delta: number;
+}
+
+/** 正权环上的一条边及其由哪些期望行推导而来。 */
+export interface RepairCycleEdge {
+  fromId: string;
+  toId: string;
+  weight: number;
+  expectationLines: number[]; // 产生该约束的输入行号
+}
+
+export interface RepairResult {
+  feasible: boolean; // 是否存在只提高优先级即可满足全部期望的方案
+  expectations: RepairExpectation[];
+  invalidLines: RepairInvalidLine[];
+  rules: RepairRuleChange[]; // 全部规则调整前后的优先级（按输入顺序）
+  conflictCycle: RepairCycleEdge[] | null; // 不可行时的一组闭环冲突期望
+}
+
 const PARAM_PLACEHOLDER = 'x'; // 见证路径中为参数段生成的具体值
 const MAX_SAMPLE_COUNT = 1_000_000_000; // 单条样本允许的最大请求次数
 
@@ -668,3 +723,404 @@ export function buildRepro(inputs: RuleInput[], selectedIds: string[]): ReproRes
     paths,
   };
 }
+
+const MAX_REPAIR_LINES = 5000;
+const MAX_REPAIR_LINE_LEN = 500;
+
+/**
+ * 解析一行修复期望：格式 “请求路径 => 期望胜出规则ID”，=> 两侧可留空白。
+ * 空行与 # 注释返回 null；格式非法返回 { error }。路径与规则本身的合法性由修复流程逐行校验。
+ */
+export function parseRepairLine(
+  line: string,
+): { path: string; targetId: string } | { error: string } | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const parts = trimmed.split('=>');
+  if (parts.length !== 2) {
+    return { error: '格式应为 “请求路径 => 期望胜出规则ID”' };
+  }
+  const pathToken = parts[0].trim();
+  const targetId = parts[1].trim();
+  if (/\s/.test(pathToken)) {
+    return { error: '路径中不能包含空白字符' };
+  }
+  if (!pathToken.startsWith('/')) {
+    return { error: `路径 "${pathToken || '(空)'}" 必须以 / 开头` };
+  }
+  if (/\s/.test(targetId)) {
+    return { error: '规则 ID 中不能包含空白字符' };
+  }
+  if (!/^R\d+$/.test(targetId)) {
+    return { error: `规则 ID "${targetId || '(空)'}" 非法，应为 R1、R2 形式` };
+  }
+  return { path: pathToken, targetId };
+}
+
+interface RepairEdge {
+  from: number;
+  to: number;
+  weight: 0 | 1;
+  lines: number[]; // 产生该边的期望输入行号
+}
+
+/** Tarjan 强连通分量（迭代实现，避免大输入递归过深）；返回每个规则的分量号与分量列表。 */
+function tarjanSCC(
+  n: number,
+  adjacency: number[][],
+): { compOf: number[]; components: number[][] } {
+  const indexOf = new Array<number>(n).fill(-1);
+  const low = new Array<number>(n).fill(0);
+  const onStack = new Array<boolean>(n).fill(false);
+  const stack: number[] = [];
+  let nextIndex = 0;
+  const compOf = new Array<number>(n).fill(-1);
+  const components: number[][] = [];
+
+  for (let s = 0; s < n; s++) {
+    if (indexOf[s] !== -1) continue;
+    // 迭代 DFS：帧 [节点, 下一条待访问邻边下标]
+    const frames: Array<[number, number]> = [[s, 0]];
+    indexOf[s] = low[s] = nextIndex++;
+    stack.push(s);
+    onStack[s] = true;
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      const v = frame[0];
+      if (frame[1] < adjacency[v].length) {
+        const w = adjacency[v][frame[1]++];
+        if (indexOf[w] === -1) {
+          indexOf[w] = low[w] = nextIndex++;
+          stack.push(w);
+          onStack[w] = true;
+          frames.push([w, 0]);
+        } else if (onStack[w]) {
+          low[v] = Math.min(low[v], indexOf[w]);
+        }
+      } else {
+        if (low[v] === indexOf[v]) {
+          const comp: number[] = [];
+          let cid: number;
+          do {
+            cid = stack.pop()!;
+            onStack[cid] = false;
+            compOf[cid] = components.length;
+            comp.push(cid);
+          } while (cid !== v);
+          comp.sort((x, y) => x - y);
+          components.push(comp);
+        }
+        frames.pop();
+        if (frames.length > 0) {
+          const parent = frames[frames.length - 1][0];
+          low[parent] = Math.min(low[parent], low[v]);
+        }
+      }
+    }
+  }
+  return { compOf, components };
+}
+
+/**
+ * 从含正权环的 SCC 中确定性地找出一条由 d=1 边构成的闭环。
+ * 从该分量内编号最小的 d=1 边出发（行号最小者优先），沿分量内邻边 BFS 回到其起点。
+ */
+function extractCycle(
+  component: number[],
+  outAdj: Map<number, RepairEdge[]>,
+  n: number,
+): RepairEdge[] {
+  const inComp = new Set(component);
+  const firstEdges: RepairEdge[] = [];
+  for (const v of component) {
+    for (const e of outAdj.get(v) ?? []) {
+      if (e.weight === 1 && inComp.has(e.to)) firstEdges.push(e);
+    }
+  }
+  firstEdges.sort((a, b) => a.from - b.from || a.to - b.to || a.lines[0] - b.lines[0]);
+  const start = firstEdges[0];
+
+  // BFS：start.to → start.from，只走分量内的边；记录前驱边
+  const prevEdge = new Array<RepairEdge | null>(n).fill(null);
+  const seen = new Array<boolean>(n).fill(false);
+  seen[start.to] = true;
+  const queue: number[] = [start.to];
+  let head = 0;
+  while (head < queue.length) {
+    const v = queue[head++];
+    const neighbors = [...(outAdj.get(v) ?? [])].sort(
+      (a, b) => a.to - b.to || a.lines[0] - b.lines[0],
+    );
+    for (const e of neighbors) {
+      if (!inComp.has(e.to) || seen[e.to]) continue;
+      seen[e.to] = true;
+      prevEdge[e.to] = e;
+      queue.push(e.to);
+    }
+  }
+  const cycle: RepairEdge[] = [start];
+  let cur = start.from;
+  while (cur !== start.to) {
+    const e = prevEdge[cur];
+    if (!e) break; // 同 SCC 内理论上必然可达
+    cycle.unshift(e);
+    cur = e.from;
+  }
+  return cycle;
+}
+
+/**
+ * 优先级修复：逐行读取“请求路径 => 期望胜出规则ID”，按当前匹配与
+ * “优先级高者先、平手按输入顺序”推导规则间的 0/1 差值约束，在只允许提高
+ * 整数优先级的前提下，给出逐项增幅最小的确定性方案。
+ *
+ * 约束模型：对期望目标 t 与其路径上的每个对手 r，新优先级 P' 满足
+ *   P'[t] ≥ P'[r] + d，d 为 0（t 当前已胜 r）或 1（r 当前胜 t）；
+ * 另有 P'[v] ≥ P[v]（只许提高）。用 Tarjan 求强连通分量：分量内存在 d=1
+ * 边即正权环（互相要求严格超过，闭环冲突）；零权环在分量内合并为等值变量，
+ * 缩点 DAG 上取最长路径即得逐点最小整数解。
+ */
+export function repairPriorities(
+  inputs: RuleInput[],
+  lines: string[],
+): RepairResult {
+  const { rules } = analyze(inputs);
+  const n = rules.length;
+  const expectations: RepairExpectation[] = [];
+  const invalidLines: RepairInvalidLine[] = [];
+  // 同一条 (from,to) 边合并：取最大权重，行号去重
+  const edgeMap = new Map<string, RepairEdge>();
+
+  const addEdge = (from: number, to: number, weight: 0 | 1, lineNo: number) => {
+    const key = `${from}|${to}`;
+    const existing = edgeMap.get(key);
+    if (existing) {
+      if (weight > existing.weight) existing.weight = weight;
+      if (!existing.lines.includes(lineNo)) {
+        existing.lines.push(lineNo);
+        existing.lines.sort((a, b) => a - b);
+      }
+    } else {
+      edgeMap.set(key, { from, to, weight, lines: [lineNo] });
+    }
+  };
+
+  lines.forEach((rawLine, i) => {
+    const lineNo = i + 1;
+    const trimmed = rawLine.trim();
+    const parsed = parseRepairLine(rawLine);
+    if (parsed === null) return; // 空行或注释
+    if ('error' in parsed) {
+      invalidLines.push({ line: lineNo, raw: trimmed, error: parsed.error });
+      return;
+    }
+    const targetRule = rules.find((r) => r.id === parsed.targetId);
+    if (!targetRule) {
+      invalidLines.push({
+        line: lineNo,
+        raw: trimmed,
+        error: `规则 ${parsed.targetId} 不存在`,
+      });
+      return;
+    }
+    if (targetRule.error) {
+      invalidLines.push({
+        line: lineNo,
+        raw: trimmed,
+        error: `规则 ${parsed.targetId} 非法：${targetRule.error}`,
+      });
+      return;
+    }
+    if (!targetRule.enabled) {
+      invalidLines.push({
+        line: lineNo,
+        raw: trimmed,
+        error: `规则 ${parsed.targetId} 已禁用，不能作为期望胜出规则`,
+      });
+      return;
+    }
+    const pathSegs = splitPath(parsed.path);
+    const normPath = '/' + pathSegs.join('/');
+    const hits = rules
+      .filter((r) => r.enabled && !r.error && matchSegments(r.segments, pathSegs))
+      .sort((x, y) => y.priority - x.priority || x.index - y.index);
+    if (hits.length === 0) {
+      invalidLines.push({ line: lineNo, raw: trimmed, error: `路径 ${normPath} 未命中任何规则` });
+      return;
+    }
+    if (!hits.some((r) => r.id === parsed.targetId)) {
+      invalidLines.push({
+        line: lineNo,
+        raw: trimmed,
+        error: `规则 ${parsed.targetId} 不匹配路径 ${normPath}`,
+      });
+      return;
+    }
+    const t = targetRule.index;
+    const constraints: RepairConstraint[] = [];
+    for (const r of hits) {
+      if (r.index === t) continue;
+      // t 当前已胜 r（更高优先级，或平手且输入顺序更靠前）→ d=0；否则 d=1
+      const winsNow =
+        targetRule.priority > r.priority ||
+        (targetRule.priority === r.priority && targetRule.index < r.index);
+      const d: 0 | 1 = winsNow ? 0 : 1;
+      addEdge(r.index, t, d, lineNo); // P'[t] ≥ P'[r] + d
+      constraints.push({ fromId: r.id, toId: targetRule.id, weight: d });
+    }
+    expectations.push({
+      line: lineNo,
+      raw: trimmed,
+      path: normPath,
+      targetId: targetRule.id,
+      matches: hits.map((r) => r.id),
+      currentWinnerId: hits[0].id,
+      afterWinnerId: null,
+      verified: false,
+      constraints,
+    });
+  });
+
+  // 建图（只包含约束边；P'[v] ≥ P[v] 由初值 P[v] 统一承担）
+  const outAdj = new Map<number, RepairEdge[]>();
+  const adjacency: number[][] = Array.from({ length: n }, () => []);
+  for (const e of edgeMap.values()) {
+    const list = outAdj.get(e.from);
+    if (list) list.push(e);
+    else outAdj.set(e.from, [e]);
+    adjacency[e.from].push(e.to);
+  }
+
+  const { compOf, components } = tarjanSCC(n, adjacency);
+
+  // 正权环：分量内存在 d=1 边
+  let conflictComp: number[] | null = null;
+  for (const comp of components) {
+    if (comp.length < 2) continue;
+    const inComp = new Set(comp);
+    let positive = false;
+    for (const v of comp) {
+      for (const e of outAdj.get(v) ?? []) {
+        if (e.weight === 1 && inComp.has(e.to)) {
+          positive = true;
+          break;
+        }
+      }
+      if (positive) break;
+    }
+    if (positive) {
+      conflictComp = comp;
+      break;
+    }
+  }
+
+  const baseRules: RepairRuleChange[] = rules.map((r) => ({
+    id: r.id,
+    index: r.index,
+    pattern: r.pattern,
+    before: r.priority,
+    after: r.priority,
+    delta: 0,
+  }));
+
+  let conflictCycle: RepairCycleEdge[] | null = null;
+  if (conflictComp) {
+    const cycle = extractCycle(conflictComp, outAdj, n);
+    conflictCycle = cycle.map((e) => ({
+      fromId: rules[e.from].id,
+      toId: rules[e.to].id,
+      weight: e.weight,
+      expectationLines: [...e.lines],
+    }));
+    return {
+      feasible: false,
+      expectations,
+      invalidLines,
+      rules: baseRules,
+      conflictCycle,
+    };
+  }
+
+  // 缩点 DAG 上最长路径：分量初值为成员当前优先级最大值（零权环合并、只许提高）
+  const compCount = components.length;
+  const compValue = new Array<number>(compCount).fill(0);
+  components.forEach((comp, ci) => {
+    compValue[ci] = Math.max(...comp.map((v) => rules[v].priority));
+  });
+  const compEdges: Array<{ from: number; to: number; weight: 0 | 1 }> = [];
+  const compEdgeSeen = new Set<string>();
+  for (const e of edgeMap.values()) {
+    const cf = compOf[e.from];
+    const ct = compOf[e.to];
+    if (cf === ct) continue; // 可行分量内只有 d=0 边，不影响取值
+    const key = `${cf}|${ct}`;
+    const prev = compEdges.find((x) => x.from === cf && x.to === ct);
+    if (prev) {
+      if (e.weight > prev.weight) prev.weight = e.weight;
+    } else if (!compEdgeSeen.has(key)) {
+      compEdgeSeen.add(key);
+      compEdges.push({ from: cf, to: ct, weight: e.weight });
+    }
+  }
+  // Tarjan 分量号即逆拓扑序，正向遍历需按依赖顺序；用入度 Kahn 保证确定
+  const indegree = new Array<number>(compCount).fill(0);
+  const compAdj: number[][] = Array.from({ length: compCount }, () => []);
+  for (const e of compEdges) {
+    compAdj[e.from].push(e.to);
+    indegree[e.to]++;
+  }
+  for (const arr of compAdj) arr.sort((a, b) => a - b);
+  const queue: number[] = [];
+  for (let ci = 0; ci < compCount; ci++) if (indegree[ci] === 0) queue.push(ci);
+  queue.sort((a, b) => a - b);
+  let head = 0;
+  while (head < queue.length) {
+    const cf = queue[head++];
+    for (const ct of compAdj[cf]) {
+      const edge = compEdges.find((x) => x.from === cf && x.to === ct)!;
+      compValue[ct] = Math.max(compValue[ct], compValue[cf] + edge.weight);
+      if (--indegree[ct] === 0) {
+        // 按编号插入保持队列确定
+        let lo = head;
+        let hi = queue.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (queue[mid] < ct) lo = mid + 1;
+          else hi = mid;
+        }
+        queue.splice(lo, 0, ct);
+      }
+    }
+  }
+
+  const newPriority = rules.map((r) => compValue[compOf[r.index]]);
+
+  // 用调整后的优先级重新模拟，验证每条期望
+  const adjusted: RuleInput[] = rules.map((r) => ({
+    pattern: r.pattern,
+    priority: newPriority[r.index],
+    enabled: r.enabled,
+  }));
+  const { rules: adjustedRules } = analyze(adjusted);
+  expectations.forEach((exp) => {
+    const winner = findWinner(adjustedRules, splitPath(exp.path));
+    exp.afterWinnerId = winner ? winner.id : null;
+    exp.verified = winner !== null && winner.id === exp.targetId;
+  });
+
+  const ruleChanges: RepairRuleChange[] = baseRules.map((r) => ({
+    ...r,
+    after: newPriority[r.index],
+    delta: newPriority[r.index] - r.before,
+  }));
+
+  return {
+    feasible: true,
+    expectations,
+    invalidLines,
+    rules: ruleChanges,
+    conflictCycle: null,
+  };
+}
+
+export { MAX_REPAIR_LINES, MAX_REPAIR_LINE_LEN };

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { analyzeRules, matchPath, computeRepro } from './api';
 import type { AnalysisResult, MatchResult, ReproResult, RuleInput } from './types';
 import ImpactView from './ImpactView';
+import RepairView from './RepairView';
 
 const MAX_REPRO_RULES = 20; // 与后端一致：复现包最多选择的规则数
 
@@ -57,7 +58,7 @@ function toRuleInputs(text: string, disabled?: Set<number>): RuleInput[] {
 }
 
 export default function App() {
-  const [mode, setMode] = useState<'analyze' | 'impact'>('analyze');
+  const [mode, setMode] = useState<'analyze' | 'impact' | 'repair'>('analyze');
   const [text, setText] = useState(EXAMPLE);
   const [candidateText, setCandidateText] = useState(CANDIDATE_EXAMPLE);
   const [samplesText, setSamplesText] = useState(SAMPLES_EXAMPLE);
@@ -265,6 +266,12 @@ export default function App() {
           >
             变更影响
           </button>
+          <button
+            className={mode === 'repair' ? 'tab tab-active' : 'tab'}
+            onClick={() => setMode('repair')}
+          >
+            优先级修复
+          </button>
         </div>
       </header>
 
@@ -278,6 +285,12 @@ export default function App() {
           onSamplesTextChange={setSamplesText}
           baselineInputs={ruleInputs}
           candidateInputs={candidateInputs}
+        />
+      ) : mode === 'repair' ? (
+        <RepairView
+          baselineText={text}
+          onBaselineTextChange={setText}
+          baselineInputs={ruleInputs}
         />
       ) : (
       <main className="layout">

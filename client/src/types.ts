@@ -95,3 +95,52 @@ export interface ReproResult {
   totalConflicts: number;
   paths: ReproPath[];
 }
+
+// ---------- 优先级修复 ----------
+export interface RepairConstraint {
+  fromId: string;
+  toId: string;
+  weight: 0 | 1;
+}
+
+export interface RepairExpectation {
+  line: number;
+  raw: string;
+  path: string;
+  targetId: string;
+  matches: string[];
+  currentWinnerId: string | null;
+  afterWinnerId: string | null;
+  verified: boolean;
+  constraints: RepairConstraint[];
+}
+
+export interface RepairInvalidLine {
+  line: number;
+  raw: string;
+  error: string;
+}
+
+export interface RepairRuleChange {
+  id: string;
+  index: number;
+  pattern: string;
+  before: number;
+  after: number;
+  delta: number;
+}
+
+export interface RepairCycleEdge {
+  fromId: string;
+  toId: string;
+  weight: number;
+  expectationLines: number[];
+}
+
+export interface RepairResult {
+  feasible: boolean;
+  expectations: RepairExpectation[];
+  invalidLines: RepairInvalidLine[];
+  rules: RepairRuleChange[];
+  conflictCycle: RepairCycleEdge[] | null;
+}

@@ -11,6 +11,8 @@ import {
   impact,
   buildRepro,
   selectMinCover,
+  repairPriorities,
+  parseRepairLine,
 } from '../dist/analyzer.js';
 
 const P = (s) => parsePattern(s);
@@ -379,5 +381,207 @@ assert.deepEqual(
 );
 // 空全集 → 空解
 assert.deepEqual(selectMinCover([], [], [], 0), []);
+
+// ---------- 优先级修复：期望行解析 ----------
+assert.deepEqual(parseRepairLine('/api/users/1 => R2'), {
+  path: '/api/users/1',
+  targetId: 'R2',
+});
+assert.deepEqual(parseRepairLine('/a=>R1'), { path: '/a', targetId: 'R1' }); // 无空格亦可
+assert.equal(parseRepairLine(''), null);
+assert.equal(parseRepairLine('  # 注释'), null);
+assert.ok('error' in parseRepairLine('/a R1')); // 缺少 =>
+assert.ok('error' in parseRepairLine('/a => R1 => R2')); // 多个 =>
+assert.ok('error' in parseRepairLine('a => R1')); // 路径须以 / 开头
+assert.ok('error' in parseRepairLine('/a/b => X1')); // 规则 ID 非法
+assert.ok('error' in parseRepairLine('/a b => R1')); // 路径含空白
+assert.ok('error' in parseRepairLine('/a => R 1')); // 目标含空白
+
+// ---------- 优先级修复：最小增幅方案 ----------
+const repairRules = [
+  { pattern: '/api/users/new', priority: 10, enabled: true }, // R1
+  { pattern: '/api/users/:id', priority: 100, enabled: true }, // R2
+  { pattern: '/api/*', priority: 1, enabled: true }, // R3
+  { pattern: '/health', priority: 0, enabled: true }, // R4
+];
+const rep = repairPriorities(repairRules, [
+  '/api/users/new => R1', // 让精确规则 R1 反超 R2
+  '/health => R4', // R4 本就胜出 → 零改动
+]);
+assert.equal(rep.feasible, true);
+assert.equal(rep.conflictCycle, null);
+// R1 须严格超过 R2(100)：最小为 101；R3 与 R1 平手按输入顺序已胜 → 不约束抬升
+assert.deepEqual(
+  rep.rules.map((r) => [r.before, r.after, r.delta]),
+  [
+    [10, 101, 91],
+    [100, 100, 0],
+    [1, 1, 0],
+    [0, 0, 0],
+  ],
+);
+assert.equal(rep.expectations.length, 2);
+const e1 = rep.expectations[0];
+assert.equal(e1.path, '/api/users/new');
+assert.equal(e1.targetId, 'R1');
+assert.equal(e1.currentWinnerId, 'R2');
+assert.equal(e1.afterWinnerId, 'R1');
+assert.equal(e1.verified, true);
+assert.deepEqual(e1.matches, ['R2', 'R1', 'R3']);
+// 对 R2 为 1 差（当前 R2 胜），对 R3 为 0 差（提升后平手即可胜）
+assert.deepEqual(
+  e1.constraints.map((c) => [c.fromId, c.toId, c.weight]),
+  [
+    ['R2', 'R1', 1],
+    ['R3', 'R1', 0],
+  ],
+);
+assert.equal(rep.expectations[1].verified, true);
+
+// 目标当前已胜出 → 不改动任何优先级（逐项最小）
+const keep = repairPriorities(
+  [
+    { pattern: '/a', priority: 100, enabled: true },
+    { pattern: '/a', priority: 1, enabled: true },
+  ],
+  ['/a => R1'],
+);
+assert.equal(keep.feasible, true);
+assert.deepEqual(keep.rules.map((r) => r.delta), [0, 0]);
+
+// 平手按输入顺序：要让顺序靠后的 R3 胜出，只需 +1
+const tieRepair = repairPriorities(
+  [
+    { pattern: '/a/:x', priority: 5, enabled: true },
+    { pattern: '/a/b', priority: 5, enabled: true },
+    { pattern: '/a/*', priority: 5, enabled: true },
+  ],
+  ['/a/b => R3'],
+);
+assert.equal(tieRepair.feasible, true);
+assert.deepEqual(tieRepair.rules.map((r) => r.after), [5, 5, 6]);
+assert.equal(tieRepair.expectations[0].verified, true);
+
+// 同优先级四人竞争，让最后一条胜出只需提到 1
+const four = repairPriorities(
+  Array.from({ length: 4 }, () => ({ pattern: '/a', priority: 0, enabled: true })),
+  ['/a => R4'],
+);
+assert.deepEqual(four.rules.map((r) => r.after), [0, 0, 0, 1]);
+
+// 零差约束传递合并：多个期望把规则连成链，分量取成员当前最大优先级
+const linked = repairPriorities(
+  [
+    { pattern: '/a', priority: 0, enabled: true }, // R1
+    { pattern: '/a', priority: 0, enabled: true }, // R2
+    { pattern: '/a', priority: 0, enabled: true }, // R3
+  ],
+  ['/a => R2', '/a => R3'], // 同路径矛盾 → 实为正权环；改用跨路径零差场景
+);
+assert.equal(linked.feasible, false);
+
+// 合法的零差链：/a 上 R3 当前已胜 R2（输入顺序靠后平手并不胜）……
+// 场景：/a 命中 R2、R3，期望 R3（当前平手落后 → 1 差边 R2→R3）；
+// /x 命中 R1、R2，期望 R2 严格超过 R1（1 差边 R1→R2）。链式最长路径逐点最小。
+const zeroChain = repairPriorities(
+  [
+    { pattern: '/x', priority: 0, enabled: true }, // R1 只命中 /x
+    { pattern: '/:p', priority: 0, enabled: true }, // R2 命中 /x、/a
+    { pattern: '/a', priority: 0, enabled: true }, // R3 只命中 /a
+  ],
+  ['/a => R3', '/x => R2'],
+);
+assert.equal(zeroChain.feasible, true);
+assert.deepEqual(zeroChain.rules.map((r) => r.after), [0, 1, 2]);
+assert.ok(zeroChain.expectations.every((e) => e.verified));
+
+// 零差边并入同一分量：目标已凭更高优先级胜出时只生成 0 差边；分量内成员被
+// 后续 1 差边整体抬高（零差约束需合并求解，而非各算各的）。
+const zeroMerge = repairPriorities(
+  [
+    { pattern: '/x', priority: 0, enabled: true }, // R1 只命中 /x
+    { pattern: '/:p', priority: 5, enabled: true }, // R2 命中 /x、/a
+    { pattern: '/a', priority: 0, enabled: true }, // R3 只命中 /a
+  ],
+  // /x：R2(5) 已胜 R1(0) → 0 差边 R1→R2；/a：R3(0) 落后 R2(5) → 1 差边 R2→R3
+  ['/x => R2', '/a => R3'],
+);
+assert.equal(zeroMerge.feasible, true);
+// 最长路径：R3 ≥ R2+1 = 6；R2 保持 5；R1 保持 0（0 差边不会把 R1 也抬到 5）
+assert.deepEqual(zeroMerge.rules.map((r) => r.after), [0, 5, 6]);
+assert.deepEqual(
+  zeroMerge.expectations[0].constraints.map((c) => c.weight),
+  [0],
+);
+assert.ok(zeroMerge.expectations.every((e) => e.verified));
+
+// ---------- 优先级修复：正权环闭环冲突 ----------
+const cyc = repairPriorities(
+  [
+    { pattern: '/a/:x', priority: 1, enabled: true },
+    { pattern: '/a/b', priority: 2, enabled: true },
+  ],
+  ['/a/b => R1', '/a/b => R2'],
+);
+assert.equal(cyc.feasible, false);
+assert.ok(cyc.conflictCycle !== null);
+// 闭环包含一个 d=1 边，并标注推导它的期望行号
+assert.equal(cyc.conflictCycle.some((e) => e.weight === 1), true);
+const nodeSet = new Set(cyc.conflictCycle.map((e) => [e.fromId, e.toId]).flat());
+assert.deepEqual([...nodeSet].sort(), ['R1', 'R2']);
+const edgeLines = cyc.conflictCycle.flatMap((e) => e.expectationLines);
+assert.deepEqual([...new Set(edgeLines)].sort(), [1, 2]);
+// 不可行时不给出修改方案
+assert.ok(cyc.rules.every((r) => r.delta === 0));
+
+// 三方互斥：同一路径三条规则都被要求胜出
+const tri = repairPriorities(
+  Array.from({ length: 3 }, () => ({ pattern: '/x', priority: 1, enabled: true })),
+  ['/x => R1', '/x => R2', '/x => R3'],
+);
+assert.equal(tri.feasible, false);
+assert.ok(tri.conflictCycle !== null);
+assert.ok(tri.conflictCycle.length >= 2);
+
+// ---------- 优先级修复：逐行错误提示 ----------
+const bad = repairPriorities(repairRules, [
+  '/nope => R1', // 未命中
+  '/health => R2', // 目标规则不匹配
+  '/health => R9', // 规则不存在
+  'garbage-line', // 格式非法
+  '/api/users/new => R1', // 合法
+]);
+assert.equal(bad.expectations.length, 1);
+assert.equal(bad.invalidLines.length, 4);
+assert.deepEqual(bad.invalidLines.map((v) => v.line), [1, 2, 3, 4]);
+assert.match(bad.invalidLines[0].error, /未命中/);
+assert.match(bad.invalidLines[1].error, /不匹配/);
+assert.match(bad.invalidLines[2].error, /不存在/);
+assert.match(bad.invalidLines[3].error, /格式/);
+// 合法行仍参与求解
+assert.equal(bad.feasible, true);
+assert.equal(bad.expectations[0].verified, true);
+
+// 禁用与非法规则作为目标须逐行报错
+const badTarget = repairPriorities(
+  [
+    { pattern: '/a', priority: 9, enabled: false },
+    { pattern: '/a/b*c', priority: 1, enabled: true },
+    { pattern: '/a', priority: 1, enabled: true },
+  ],
+  ['/a => R1', '/a => R2', '/a => R3'],
+);
+assert.equal(badTarget.expectations.length, 1);
+assert.match(badTarget.invalidLines.find((v) => v.line === 1).error, /禁用/);
+assert.match(badTarget.invalidLines.find((v) => v.line === 2).error, /非法/);
+
+// 确定性：相同输入重复计算结果一致
+const detInput = [
+  { pattern: '/a/:x', priority: 3, enabled: true },
+  { pattern: '/a/b', priority: 8, enabled: true },
+  { pattern: '/a/*', priority: 1, enabled: true },
+];
+const detLines = ['/a/b => R3', '/a/c => R1'];
+assert.deepEqual(repairPriorities(detInput, detLines), repairPriorities(detInput, detLines));
 
 console.log('✔ analyzer 全部测试通过');
